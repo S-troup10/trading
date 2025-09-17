@@ -7,19 +7,13 @@ import random
 import json
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import ccxt
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import VecNormalize
-
-from stable_baselines3.common.evaluation import evaluate_policy
-
-
-
+from typing import Optional, Tuple
 
 SYMBOL = "BTC/USDT"
 EXCHANGE = "binance"
@@ -54,6 +48,95 @@ MODEL_PATH = os.path.join(MODEL_DIR, "crypto.zip")
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
+
+
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Return RSI values scaled to [0, 1]."""
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    roll_up = gain.ewm(alpha=1 / period, adjust=False).mean()
+    roll_down = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-9)
+    rsi = 100 - (100 / (1 + rs))
+    return (rsi / 100.0).fillna(0.5)
+
+
+def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute a richer feature set for the trading agent."""
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    volume = df["volume"].astype(float)
+
+    features = pd.DataFrame(index=df.index)
+
+    log_return_1 = np.log(close / close.shift(1))
+    log_return_3 = np.log(close / close.shift(3))
+    log_return_6 = np.log(close / close.shift(6))
+    volatility = log_return_1.rolling(window=48, min_periods=2).std()
+
+    ema_fast = close.ewm(span=12, adjust=False).mean()
+    ema_slow = close.ewm(span=32, adjust=False).mean()
+    sma_medium = close.rolling(window=48, min_periods=2).mean()
+
+    features["log_return_1"] = log_return_1
+    features["log_return_3"] = log_return_3
+    features["log_return_6"] = log_return_6
+    features["volatility"] = volatility
+    features["ema_fast_ratio"] = (close / (ema_fast + 1e-9)) - 1.0
+    features["ema_slow_ratio"] = (close / (ema_slow + 1e-9)) - 1.0
+    features["sma_medium_ratio"] = (close / (sma_medium + 1e-9)) - 1.0
+    features["rsi"] = compute_rsi(close, period=14)
+
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = true_range.ewm(span=14, adjust=False).mean()
+    features["atr_pct"] = atr / (close + 1e-9)
+
+    vol_mean = volume.rolling(window=48, min_periods=2).mean()
+    vol_std = volume.rolling(window=48, min_periods=2).std()
+    features["volume_zscore"] = (volume - vol_mean) / (vol_std + 1e-9)
+
+    price_range = (high - low) / (close + 1e-9)
+    features["intraday_range"] = price_range
+
+    features = features.replace([np.inf, -np.inf], np.nan).fillna(method="bfill").fillna(0.0)
+    return features
+
+
+def split_and_scale_features(features: pd.DataFrame, split_idx: int) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """Split features and standardise based on the training sample."""
+    train_df = features.iloc[:split_idx].copy()
+    test_df = features.iloc[split_idx:].copy()
+
+    mean = train_df.mean()
+    std = train_df.std().replace(0.0, 1.0)
+
+    train_scaled = ((train_df - mean) / std).to_numpy(dtype=np.float32)
+    test_scaled = ((test_df - mean) / std).to_numpy(dtype=np.float32)
+
+    stats = {
+        "columns": list(features.columns),
+        "mean": mean.to_numpy(dtype=np.float32),
+        "std": std.to_numpy(dtype=np.float32),
+    }
+
+    return train_scaled, test_scaled, stats
+
+
+def compute_max_drawdown(equity_curve: np.ndarray) -> float:
+    if len(equity_curve) == 0:
+        return 0.0
+    peaks = np.maximum.accumulate(equity_curve)
+    drawdowns = (equity_curve - peaks) / (peaks + 1e-9)
+    return float(np.abs(drawdowns.min()))
 
 
 # -----------------------
@@ -95,6 +178,9 @@ train_vols = df_train["volume"].to_numpy(dtype=np.float32)
 test_prices = df_test["close"].to_numpy(dtype=np.float32)
 test_vols = df_test["volume"].to_numpy(dtype=np.float32)
 
+feature_df = build_feature_matrix(df).reset_index(drop=True)
+train_features, test_features, feature_stats = split_and_scale_features(feature_df, split_idx)
+
 
 class TradingEnvContinuous(gym.Env):
     """
@@ -114,7 +200,8 @@ class TradingEnvContinuous(gym.Env):
 
     def __init__(self, prices, timestamps=None, volumes=None, window_size=48, initial_balance=10000.0,
                  transaction_cost_pct=0.0, slippage_pct=0.0, episode_length=200,
-                 buy_threshold=0.05, sell_threshold=-0.05, max_trade_fraction=0.5):
+                 buy_threshold=0.05, sell_threshold=-0.05, max_trade_fraction=0.5,
+                 features: Optional[np.ndarray] = None):
         super().__init__()
 
         # Core data
@@ -124,6 +211,16 @@ class TradingEnvContinuous(gym.Env):
         else:
             self.timestamps = np.array(timestamps)
         self.volumes = np.array(volumes, dtype=np.float32).ravel() if volumes is not None else np.ones_like(self.prices)
+
+        if features is not None:
+            feature_matrix = np.asarray(features, dtype=np.float32)
+            if feature_matrix.shape[0] != len(self.prices):
+                raise ValueError("Feature matrix length must match prices length.")
+            self.feature_matrix = feature_matrix
+            self.num_features = int(feature_matrix.shape[1])
+        else:
+            self.feature_matrix = None
+            self.num_features = 7
 
         # config
         self.window_size = int(window_size)
@@ -140,7 +237,6 @@ class TradingEnvContinuous(gym.Env):
         self.max_trade_fraction = float(max_trade_fraction)  # e.g. 0.5 => at most 50% balance per buy
 
         # features / spaces (keep same num_features to match your obs builder)
-        self.num_features = 7
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf,
                                             shape=(self.window_size * self.num_features,), dtype=np.float32)
         # single continuous scalar in [-1, 1]
@@ -182,24 +278,32 @@ class TradingEnvContinuous(gym.Env):
         start = int(self.current_step - self.window_size)
         if start < 0:
             start = 0
-        window_prices = self.prices[start:self.current_step]
-        if len(window_prices) < self.window_size:
-            pad_len = self.window_size - len(window_prices)
-            pad_val = window_prices[0] if len(window_prices) > 0 else self.prices[self.current_step]
-            pad = np.full(pad_len, pad_val, dtype=window_prices.dtype)
-            window_prices = np.concatenate([pad, window_prices])
+        if self.feature_matrix is not None:
+            window_feats = self.feature_matrix[start:self.current_step]
+            if window_feats.shape[0] < self.window_size:
+                if window_feats.shape[0] == 0:
+                    pad = np.zeros((self.window_size, self.num_features), dtype=np.float32)
+                    window_feats = pad
+                else:
+                    pad = np.repeat(window_feats[:1], self.window_size - window_feats.shape[0], axis=0)
+                    window_feats = np.vstack([pad, window_feats])
+            obs = window_feats.astype(np.float32)
+        else:
+            window_prices = self.prices[start:self.current_step]
+            if len(window_prices) < self.window_size:
+                pad_len = self.window_size - len(window_prices)
+                pad_val = window_prices[0] if len(window_prices) > 0 else self.prices[self.current_step]
+                pad = np.full(pad_len, pad_val, dtype=window_prices.dtype)
+                window_prices = np.concatenate([pad, window_prices])
 
-        obs = np.zeros((self.window_size, self.num_features), dtype=np.float32)
-        prev = np.concatenate([[window_prices[0]], window_prices[:-1]])
-        # returns / price change
-        obs[:, 0] = (window_prices - prev) / (prev + 1e-8)
+            obs = np.zeros((self.window_size, self.num_features), dtype=np.float32)
+            prev = np.concatenate([[window_prices[0]], window_prices[:-1]])
+            obs[:, 0] = (window_prices - prev) / (prev + 1e-8)
 
-        # other features left as zeros unless you compute them (you can compute RSI/EMA externally and pass in)
-        # Keep vol normalized in last column like before
-        max_vol = np.max(self.volumes) if np.max(self.volumes) > 0 else 1.0
-        vol_w = self.volumes[start:self.current_step]
-        vol_w = np.pad(vol_w, (self.window_size - len(vol_w), 0), 'constant') if len(vol_w) < self.window_size else vol_w
-        obs[:, 6] = np.nan_to_num(vol_w / max_vol, nan=0.0)
+            max_vol = np.max(self.volumes) if np.max(self.volumes) > 0 else 1.0
+            vol_w = self.volumes[start:self.current_step]
+            vol_w = np.pad(vol_w, (self.window_size - len(vol_w), 0), 'constant') if len(vol_w) < self.window_size else vol_w
+            obs[:, -1] = np.nan_to_num(vol_w / max_vol, nan=0.0)
 
         flat = obs.flatten()
         flat = np.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -456,6 +560,7 @@ def make_train_env():
             buy_threshold=BUY_THRESHOLD,
             sell_threshold=SELL_THRESHOLD,
             max_trade_fraction=MAX_TRADE_FRACTION,
+            features=train_features,
         )
         return Monitor(env)
     venv = DummyVecEnv([_init])
@@ -489,7 +594,6 @@ def train_ppo(total_timesteps=TOTAL_TIMESTEPS, model_path=MODEL_PATH, reload=Fal
 
     model.learn(total_timesteps=total_timesteps, progress_bar=True)
     model.save(model_path)
-    vec_env.save(os.path.join(MODEL_DIR, "vecnormalize.pkl"))
     print("[train] Model saved to", model_path)
     vec_env.close()
     return model
@@ -516,6 +620,7 @@ def evaluate_model(model, n_episodes=10, verbose=True):
             buy_threshold=BUY_THRESHOLD,
             sell_threshold=SELL_THRESHOLD,
             max_trade_fraction=MAX_TRADE_FRACTION,
+            features=test_features,
         )
         obs, _ = env.reset()
         done = False
@@ -546,11 +651,19 @@ def evaluate_model(model, n_episodes=10, verbose=True):
             # crude placeholder: wins counted as sells present (refine as needed)
             win_rate = len([t for t in env.trades if str(t[0]).lower().startswith("sell")]) / closed_trades
 
+        returns = np.diff(hist_pv) / (hist_pv[:-1] + 1e-9) if len(hist_pv) > 1 else np.array([])
+        sharpe = 0.0
+        if returns.size > 1 and float(np.std(returns)) > 1e-9:
+            sharpe = float(np.sqrt(288) * np.mean(returns) / (np.std(returns) + 1e-9))
+        max_drawdown = compute_max_drawdown(hist_pv)
+
         ep_results.append({
             "final_equity": final_equity,
             "total_profit": total_profit,
             "num_trades": closed_trades,
             "win_rate": win_rate,
+            "sharpe": sharpe,
+            "max_drawdown": max_drawdown,
             "history_ts": hist_ts,
             "history_price": hist_prices,
             "history_pv": hist_pv,
@@ -564,18 +677,23 @@ def evaluate_model(model, n_episodes=10, verbose=True):
     avg_profit = np.mean([r["total_profit"] for r in ep_results])
     avg_trades = np.mean([r["num_trades"] for r in ep_results])
     avg_win_rate = np.mean([r["win_rate"] for r in ep_results])
+    avg_sharpe = np.mean([r["sharpe"] for r in ep_results])
+    avg_max_dd = np.mean([r["max_drawdown"] for r in ep_results])
 
     summary = {
         "avg_final_equity": float(avg_final),
         "avg_profit": float(avg_profit),
         "avg_trades": float(avg_trades),
         "avg_win_rate": float(avg_win_rate),
+        "avg_sharpe": float(avg_sharpe),
+        "avg_max_drawdown": float(avg_max_dd),
         "action_counts": action_counts,
         "episodes": ep_results,
     }
 
     print("ACTION COUNTS:", action_counts)
-    print("AVERAGE final_equity:", avg_final, "avg_profit:", avg_profit, "avg_trades:", avg_trades, "avg_win_rate:", avg_win_rate)
+    print("AVERAGE final_equity:", avg_final, "avg_profit:", avg_profit, "avg_trades:", avg_trades,
+          "avg_win_rate:", avg_win_rate, "avg_sharpe:", avg_sharpe, "avg_max_dd:", avg_max_dd)
     return summary
 
 
@@ -608,6 +726,11 @@ if __name__ == "__main__":
                 "INITIAL_BALANCE": INITIAL_BALANCE,
                 "TRANSACTION_COST_PCT": TRANSACTION_COST_PCT,
                 "SLIPPAGE_PCT": SLIPPAGE_PCT,
+                "FEATURES": {
+                    "columns": feature_stats["columns"],
+                    "mean": feature_stats["mean"].tolist(),
+                    "std": feature_stats["std"].tolist(),
+                }
             }
         }, f, default=lambda x: str(x))
 
